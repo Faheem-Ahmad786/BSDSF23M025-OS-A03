@@ -1,4 +1,5 @@
 #include "shell.h"
+#include <stdlib.h>
 
 int main() {
     char* cmdline;
@@ -6,7 +7,11 @@ int main() {
 
     while ((cmdline = read_cmd(PROMPT, stdin)) != NULL) {
         if ((arglist = tokenize(cmdline)) != NULL) {
-            execute(arglist);
+
+            // 🔹 NEW: check if the command is built-in
+            if (!handle_builtin(arglist)) {
+                execute(arglist);   // only runs if it's not a built-in
+            }
 
             // Free the memory allocated by tokenize()
             for (int i = 0; arglist[i] != NULL; i++) {
@@ -20,3 +25,4 @@ int main() {
     printf("\nShell exited.\n");
     return 0;
 }
+
