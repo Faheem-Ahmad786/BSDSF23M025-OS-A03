@@ -7,8 +7,94 @@
 #include <string.h>
 #include <signal.h>
 
-// Helper: execute single or background process
-void execute_single(char **arglist, int background) {
+#define MAX_JOBS 20
+
+typedef struct {
+    pid_t pid;
+    char cmdline[100];
+    char status[20]; // Running / Stopped / Done
+    int id;
+} Job;
+
+Job jobs[MAX_JOBS];
+int job_count = 0;
+
+// Add new job to list
+void add_job(pid_t pid, char *cmdline, char *status) {
+    if (job_count < MAX_JOBS) {
+        jobs[job_count].pid = pid;
+        strcpy(jobs[job_count].cmdline, cmdline);
+        strcpy(jobs[job_count].status, status);
+        jobs[job_count].id = job_count + 1;
+        job_count++;
+    }
+}
+
+// Remove completed job
+void remove_job(pid_t pid) {
+    for (int i = 0; i < job_count; i++) {
+        if (jobs[i].pid == pid) {
+            for (int j = i; j < job_count - 1; j++) {
+                jobs[j] = jobs[j + 1];
+            }
+            job_count--;
+            break;
+        }
+    }
+}
+
+// Display all jobs
+void list_jobs() {
+    for (int i = 0; i < job_count; i++) {
+        printf("[%d] %d %s %s\n",
+               jobs[i].id,
+               jobs[i].pid,
+               jobs[i].status,
+               jobs[i].cmdline);
+    }
+}
+
+// Signal handler for finished background processes
+void handle_sigchld(int sig) {
+    int status;
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        printf("\n[%d] done\n", pid);
+        fflush(stdout);
+        remove_job(pid);
+    }
+}
+
+// Foreground a background job
+void fg_command(int job_id) {
+    if (job_id <= 0 || job_id > job_count) {
+        printf("Invalid job ID\n");
+        return;
+    }
+
+    pid_t pid = jobs[job_id - 1].pid;
+    printf("Bringing job [%d] (%d) to foreground\n", job_id, pid);
+    strcpy(jobs[job_id - 1].status, "Foreground");
+    int status;
+    waitpid(pid, &status, 0);
+    remove_job(pid);
+}
+
+// Resume a stopped job in background
+void bg_command(int job_id) {
+    if (job_id <= 0 || job_id > job_count) {
+        printf("Invalid job ID\n");
+        return;
+    }
+
+    pid_t pid = jobs[job_id - 1].pid;
+    printf("Resuming job [%d] (%d) in background\n", job_id, pid);
+    kill(pid, SIGCONT);
+    strcpy(jobs[job_id - 1].status, "Running");
+}
+
+// Helper: execute a normal or background command
+void execute_single(char **arglist, int background, char *cmdline) {
     pid_t pid = fork();
 
     if (pid == -1) {
@@ -17,41 +103,17 @@ void execute_single(char **arglist, int background) {
     }
 
     if (pid == 0) {
-        // Child process
         execvp(arglist[0], arglist);
         perror("Command execution failed");
         exit(1);
     } else {
         if (background) {
-            printf("[%d] running in background\n", pid);
-            return; // Don't wait for it
+            printf("[%d] %d running in background\n", job_count + 1, pid);
+            add_job(pid, cmdline, "Running");
+            return;
         } else {
             waitpid(pid, NULL, 0);
         }
-    }
-}
-
-// Helper: split commands by '|'
-int split_pipes(char **arglist, char ***commands) {
-    int cmd_count = 0;
-    commands[cmd_count] = arglist;
-
-    for (int i = 0; arglist[i] != NULL; i++) {
-        if (strcmp(arglist[i], "|") == 0) {
-            arglist[i] = NULL; // terminate this command
-            commands[++cmd_count] = &arglist[i + 1];
-        }
-    }
-    return cmd_count + 1;
-}
-
-// Signal handler to notify when background process ends
-void handle_sigchld(int sig) {
-    int status;
-    pid_t pid;
-    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        printf("\n[%d] done\n", pid);
-        fflush(stdout);
     }
 }
 
@@ -59,62 +121,41 @@ void handle_sigchld(int sig) {
 void execute(char **arglist) {
     signal(SIGCHLD, handle_sigchld);
 
-    // 🔹 Detect background execution
+    if (arglist == NULL || arglist[0] == NULL) return;
+
+    // Handle built-in job commands
+    if (strcmp(arglist[0], "jobs") == 0) {
+        list_jobs();
+        return;
+    }
+
+    if (strcmp(arglist[0], "fg") == 0 && arglist[1]) {
+        fg_command(atoi(arglist[1]));
+        return;
+    }
+
+    if (strcmp(arglist[0], "bg") == 0 && arglist[1]) {
+        bg_command(atoi(arglist[1]));
+        return;
+    }
+
+    // Detect background execution
     int background = 0;
     for (int i = 0; arglist[i] != NULL; i++) {
         if (strcmp(arglist[i], "&") == 0) {
             background = 1;
-            arglist[i] = NULL; // remove '&' from arguments
+            arglist[i] = NULL;
             break;
         }
     }
 
-    // 🔹 Detect pipe in the command
-    int has_pipe = 0;
+    // Execute normally or in background
+    char cmdline[100] = "";
     for (int i = 0; arglist[i] != NULL; i++) {
-        if (strcmp(arglist[i], "|") == 0) {
-            has_pipe = 1;
-            break;
-        }
+        strcat(cmdline, arglist[i]);
+        strcat(cmdline, " ");
     }
 
-    // 🔹 Handle normal or background command (no pipe)
-    if (!has_pipe) {
-        execute_single(arglist, background);
-        return;
-    }
-
-    // 🔹 Handle piping
-    char **commands[10];  // support up to 10 piped commands
-    int num_cmds = split_pipes(arglist, commands);
-    int fd[2], in_fd = 0;
-
-    for (int i = 0; i < num_cmds; i++) {
-        pipe(fd);
-        pid_t pid = fork();
-
-        if (pid == -1) {
-            perror("fork failed");
-            exit(1);
-        }
-
-        if (pid == 0) {
-            dup2(in_fd, STDIN_FILENO);
-            if (i < num_cmds - 1) {
-                dup2(fd[1], STDOUT_FILENO);
-            }
-            close(fd[0]);
-            execvp(commands[i][0], commands[i]);
-            perror("Command execution failed");
-            exit(1);
-        } else {
-            if (!background) waitpid(pid, NULL, 0);
-            close(fd[1]);
-            in_fd = fd[0];
-        }
-    }
-
-    if (background)
-        printf("Pipeline running in background\n");
+    execute_single(arglist, background, cmdline);
 }
 
